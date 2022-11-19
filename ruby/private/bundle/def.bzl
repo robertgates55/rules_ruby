@@ -34,7 +34,7 @@ def run_bundler(runtime_ctx, bundler_arguments, previous_result):
 
     return runtime_ctx.ctx.execute(
         args,
-        quiet = False,
+        quiet = True,
         environment = runtime_ctx.environment,
     )
 
@@ -113,29 +113,6 @@ def install_bundler(runtime_ctx, bundler_version):
         "bundler",
     )
 
-def bundle_install(runtime_ctx, previous_result):
-    cwd = runtime_ctx.ctx.path(".")
-    bundler_args = [
-        "install",
-        "--binstubs={}".format(cwd.get_child(BUNDLE_BIN_PATH)),
-        "--path={}".format(cwd.get_child(BUNDLE_PATH)),
-        "--standalone",
-        "--gemfile={}".format(runtime_ctx.ctx.attr.gemfile.name),
-    ]
-    if runtime_ctx.ctx.attr.gemfile_lock:
-        bundler_args += ["--deployment", "--frozen"]
-
-    result = run_bundler(
-        runtime_ctx,
-        bundler_args,
-        previous_result,
-    )
-
-    if result.return_code:
-        fail("bundle install failed: %s%s" % (result.stdout, result.stderr))
-    else:
-        return result
-
 def generate_bundle_build_file(runtime_ctx, previous_result):
     if runtime_ctx.ctx.attr.gemfile_lock:
         gemfile_lock = runtime_ctx.ctx.attr.gemfile_lock.name
@@ -161,6 +138,7 @@ def generate_bundle_build_file(runtime_ctx, previous_result):
     result = runtime_ctx.ctx.execute(args, quiet = False)
     if result.return_code:
         fail("build file generation failed: %s%s" % (result.stdout, result.stderr))
+
 
 def _ruby_bundle_impl(ctx):
     ctx.symlink(ctx.attr.gemfile, ctx.attr.gemfile.name)
@@ -191,10 +169,7 @@ def _ruby_bundle_impl(ctx):
     # 2. Set Bundler config in the .bundle/config file
     result = set_bundler_config(runtime_ctx, result)
 
-    # 3. Run bundle install
-    result = bundle_install(runtime_ctx, result)
-
-    # 4. Generate the BUILD file for the bundle
+    # 3. Generate the BUILD file for the bundle
     generate_bundle_build_file(runtime_ctx, result)
 
 ruby_bundle_install = repository_rule(

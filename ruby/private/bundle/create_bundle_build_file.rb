@@ -6,6 +6,7 @@ BUILD_HEADER = <<~MAIN_TEMPLATE
     "{workspace_name}//ruby:defs.bzl",
     "ruby_library",
   )
+  load("@rules_pkg//:pkg.bzl", "pkg_tar")
 
   package(default_visibility = ["//visibility:public"])
 
@@ -23,77 +24,71 @@ BUILD_HEADER = <<~MAIN_TEMPLATE
       ],
     ),
   )
-
+  # DAVE
   # PULL EACH GEM INDIVIDUALLY
 MAIN_TEMPLATE
 
 GEM_TEMPLATE = <<~GEM_TEMPLATE
-  ruby_library(
-    name = "{name}",
-    srcs = glob(
-      include = [
-        ".bundle/config",
-        {gem_lib_files},
-        "{gem_spec}",
-        {gem_binaries}
-      ],
-      exclude = {exclude},
-    ),
-    deps = {deps},
-    includes = [{gem_lib_paths}],
+  genrule(
+    name = "{name}-gem-fetch",
+    srcs = [],
+    outs = ["{name}-{version}.gem"],
+    cmd = """
+      gem fetch --platform x86_64-linux --no-prerelease --source {source} --version {version} {name} >/dev/null
+      # Platform-specific gems contain the platform in their filename
+      mv {name}-{version}*.gem $@ >/dev/null
+    """,
+    message = "Fetching gem: {name}:{version}",
+    visibility = ["//visibility:public"],
+  )
+
+  genrule(
+    name = "{name}-gem-install",
+    srcs = [":{name}-gem-fetch"],
+    outs = ["{name}.tar.gz"],
+    cmd = """
+      export GEM_HOME=$$PWD/gem
+      mkdir -p $$GEM_HOME
+      mv $< $$PWD
+      gem install --platform x86_64-linux --no-post-install-message --no-document --no-wrappers --ignore-dependencies --local --version {version} {name} >/dev/null || true
+      # BINFILES=$$(find $$GEM_HOME/bin -type l)
+      # if [ -n "$${BINFILES}" ]; then
+      #   cd $$GEM_HOME
+      #   ls -l
+      #   find bin -type l -exec echo {} \;
+      #   cd -
+      # fi
+      tar -czf $@ -C $$GEM_HOME . >/dev/null
+    """,
+    message = "Installing gem: {name}:{version}",
+    visibility = ["//visibility:public"],
   )
 GEM_TEMPLATE
 
 GEM_GROUP = <<~GEM_GROUP
-  ruby_library(
-    name = "gems_{group_name}_group",
-    deps = {group_gems}
+  pkg_tar(
+    name = "gems-{group}",
+    srcs = {group_gem_installs},
+    owner = "1000.1000",
+    package_dir = "/vendor/bundle/ruby/{ruby_version}"
   )
 GEM_GROUP
 
 ALL_GEMS = <<~ALL_GEMS
-  ruby_library(
-    name = "gems",
-    srcs = glob([{bundle_lib_files}]) + glob(["bin/*"]),
-    includes = {bundle_lib_paths},
+  pkg_tar(
+    name = "gems_cache",
+    srcs = {cached_gems},
+    owner = "1000.1000",
+    package_dir = "/vendor/cache"
   )
 
-  ruby_library(
-    name = "bin",
-    srcs = glob(["bin/*"]),
-    deps = {bundle_with_binaries}
+  pkg_tar(
+    name = "gems",
+    deps = {gems},
+    owner = "1000.1000",
+    package_dir = "/vendor/bundle/ruby/{ruby_version}",
   )
 ALL_GEMS
-
-# For ordinary gems, this path is like 'lib/ruby/3.0.0/gems/rspec-3.10.0'.
-# For gems with native extension installed via prebuilt packages, the last part of this path can
-# contain an OS-specific suffix like 'grpc-1.38.0-universal-darwin' or 'grpc-1.38.0-x86_64-linux'
-# instead of 'grpc-1.38.0'.
-#
-# Since OS platform is unlikely to change between Bazel builds on the same machine,
-# `#{gem_name}-#{gem_version}*` would be sufficient to narrow down matches to at most one.
-#
-# Library path differs across implementations as `lib/ruby` on MRI and `lib/jruby` on JRuby.
-GEM_PATH = ->(ruby_version, gem_name, gem_version) do
-  Dir.glob("lib/#{RbConfig::CONFIG['RUBY_INSTALL_NAME']}/#{ruby_version}/gems/#{gem_name}-#{gem_version}*").first
-end
-
-# For ordinary gems, this path is like 'lib/ruby/3.0.0/specifications/rspec-3.10.0.gemspec'.
-# For gems with native extension installed via prebuilt packages, the last part of this path can
-# contain an OS-specific suffix like 'grpc-1.38.0-universal-darwin.gemspec' or
-# 'grpc-1.38.0-x86_64-linux.gemspec' instead of 'grpc-1.38.0.gemspec'.
-#
-# Since OS platform is unlikely to change between Bazel builds on the same machine,
-# `#{gem_name}-#{gem_version}*.gemspec` would be sufficient to narrow down matches to at most one.
-#
-# Library path differs across implementations as `lib/ruby` on MRI and `lib/jruby` on JRuby.
-SPEC_PATH = ->(ruby_version, gem_name, gem_version) do
-  Dir.glob("lib/#{RbConfig::CONFIG['RUBY_INSTALL_NAME']}/#{ruby_version}/specifications/#{gem_name}-#{gem_version}*.gemspec").first
-end
-
-EXTENSIONS_PATH = ->(ruby_version, gem_name, gem_version) do
-  Dir.glob("lib/#{RbConfig::CONFIG['RUBY_INSTALL_NAME']}/#{ruby_version}/extensions/*/#{gem_name}/**/*").first
-end
 
 require 'bundler'
 require 'json'
@@ -214,39 +209,34 @@ class BundleBuildFileGenerator
                         .gsub('{ruby_version}', ruby_version)
                         .gsub('{bundler_setup}', bundler_setup_require)
 
-    # strip bundler version so we can process this file
-    remove_bundler_version!
-
     # Append to the end specific gem libraries and dependencies
     bundle           = Bundler::LockfileParser.new(Bundler.read_file(gemfile_lock))
-    bundle_lib_paths = []
-    bundle_binaries  = {} # gem-name => [ gem's binaries ], ...
-    gems             = bundle.specs.map(&:name)
+    bundle.specs.each { |spec| register_gem(spec, template_out) }
+
+    remote_gems = bundle.specs.delete_if{ |spec| spec.source.path? }.map(&:name)
+    template_out.puts ALL_GEMS
+                        .gsub('{gems}', remote_gems.map { |g| ":#{g}-gem-install" }.to_s)
+                        .gsub('{cached_gems}', remote_gems.map { |g| ":#{g}-gem-fetch" }.to_s)
+                        .gsub('{ruby_version}', ruby_version)
+
+
+    # Groups stuff - we can extract this from the gemfile.lock,
+    # but via a slightly different route as we need to traverse all the deps
     bundle_deps      = Bundler::Definition.build(gemfile_lock.chomp('.lock'), gemfile_lock, {}).dependencies
     groups           = bundle_deps.map{|dep| dep.groups}.flatten.uniq
     gems_by_group    = groups.map{ |g| {g => bundle_deps
-                               .select{|dep| dep.groups.include?(g)}
-                               .reject{|dep| dep.source.path? unless dep.source.nil?}
-                               .map(&:name)}
-                              }
-                             .reduce Hash.new, :merge
-    bundle.specs.each { |spec| register_gem(spec, template_out, bundle_lib_paths, bundle_binaries) }
-
-    template_out.puts ALL_GEMS
-                        .gsub('{bundle_lib_files}', to_flat_string(bundle_lib_paths.map { |p| "#{p}/**/*" }))
-                        .gsub('{bundle_with_binaries}', bundle_binaries.keys.map { |g| ":#{g}" }.to_s)
-                        .gsub('{bundle_binaries}', bundle_binaries.values.flatten.to_s)
-                        .gsub('{bundle_lib_paths}', bundle_lib_paths.to_s)
-                        .gsub('{bundler_setup}', bundler_setup_require)
-                        .gsub('{bundle_deps}', gems.map { |g| ":#{g}" }.to_s)
-                        .gsub('{exclude}', DEFAULT_EXCLUDES.to_s)
+                       .select{|dep| dep.groups.include?(g)}
+                       .reject{|dep| dep.source.path? unless dep.source.nil?}
+                       .map(&:name)}
+                      }
+                      .reduce Hash.new, :merge
 
     gems_by_group.each do |key, value|
       template_out.puts GEM_GROUP
-                          .gsub('{group_name}', key.to_s)
-                          .gsub('{group_gems}', value.map{|s| s.prepend ':' unless s.start_with? ':'}.compact.to_s)
+                          .gsub('{group}', key.to_s)
+                          .gsub('{group_gem_installs}', value.map{|s| ":#{s}-gem-install"}.compact.to_s)
+                          .gsub('{ruby_version}', ruby_version)
     end
-
 
     ::File.open(build_file, 'w') { |f| f.puts template_out.string }
   end
@@ -261,80 +251,17 @@ class BundleBuildFileGenerator
     "${RUNFILES_DIR}/#{repo_name}/#{path}"
   end
 
-  # This method scans the contents of the Gemfile.lock and if it finds BUNDLED WITH
-  # it strips that line + the line below it, so that any version of bundler would work.
-  def remove_bundler_version!
-    contents = File.read(gemfile_lock)
-    return unless contents =~ /BUNDLED WITH/
-
-    temp_gemfile_lock = "#{gemfile_lock}.no-bundle-version"
-    system %(sed -n '/BUNDLED WITH/q;p' "#{gemfile_lock}" > #{temp_gemfile_lock})
-    ::FileUtils.rm_f(gemfile_lock) if File.symlink?(gemfile_lock) # it's just a symlink
-    ::FileUtils.move(temp_gemfile_lock, gemfile_lock, force: true)
-  end
-
-  def register_gem(spec, template_out, bundle_lib_paths, bundle_binaries)
+  def register_gem(spec, template_out)
     # Do not register local gems
     return if spec.source.path?
 
-    base_dir = "lib/ruby/#{ruby_version}"
-    if spec.source.is_a?(Bundler::Source::Git)
-      stub = spec.source.specs.find { |s| s.name == spec.name }.stub
-      gem_path = "#{base_dir}/bundler/gems/#{Pathname(stub.full_gem_path).relative_path_from(stub.base_dir)}"
-      spec_path = "#{base_dir}/bundler/gems/#{Pathname(stub.loaded_from).relative_path_from(stub.base_dir)}"
-
-      # paths to register to $LOAD_PATH
-      require_paths = stub.require_paths
-    else
-      gem_path = GEM_PATH[ruby_version, spec.name, spec.version]
-      spec_path = SPEC_PATH[ruby_version, spec.name, spec.version]
-
-      # paths to register to $LOAD_PATH
-      require_paths = Gem::StubSpecification.gemspec_stub(spec_path, base_dir, "#{base_dir}/gems").require_paths
-    end
-
-    # Usually, registering the directory paths listed in the `require_paths` of gemspecs is sufficient, but
-    # some gems also require additional paths to be included in the load paths.
-    require_paths += include_array(spec.name)
-    gem_lib_paths = require_paths.map { |require_path| File.join(gem_path, require_path) }
-    bundle_lib_paths.push(*gem_lib_paths)
-
-    # paths to search for executables
-    gem_binaries               = find_bundle_binaries(gem_path)
-    bundle_binaries[spec.name] = gem_binaries unless gem_binaries.nil? || gem_binaries.empty?
-
-    deps = spec.dependencies.map { |d| ":#{d.name}" }
-
-    warn("registering gem #{spec.name} with binaries: #{gem_binaries}") if bundle_binaries.key?(spec.name)
+    puts spec.platform if spec.name == 'nokogiri'
 
     template_out.puts GEM_TEMPLATE
-                        .gsub('{gem_lib_paths}', to_flat_string(gem_lib_paths))
-                        .gsub('{gem_lib_files}', to_flat_string(gem_lib_paths.map { |p| "#{p}/**/*" }))
-                        .gsub('{gem_spec}', spec_path)
-                        .gsub('{gem_binaries}', to_flat_string(gem_binaries))
-                        .gsub('{exclude}', exclude_array(spec.name).to_s)
                         .gsub('{name}', spec.name)
-                        .gsub('{version}', spec.version.to_s)
-                        .gsub('{deps}', deps.to_s)
-                        .gsub('{repo_name}', repo_name)
+                        .gsub('{version}', spec.version.version)
+                        .gsub('{source}', spec.source.remotes.first.to_s)
                         .gsub('{ruby_version}', ruby_version)
-                        .gsub('{bundler_setup}', bundler_setup_require)
-  end
-
-  def find_bundle_binaries(gem_path)
-    gem_bin_paths = %W(#{gem_path}/bin #{gem_path}/exe)
-
-    gem_bin_paths
-      .map do |bin_path|
-      Dir # grab all files under bin/ and exe/ inside the gem folder
-        .glob("#{bin_path}/*") # convert to File object
-        .map { |b| f = File.new(b); File.executable?(f) ? f : nil }
-        .compact # remove non-executables, take basename, minus binary defaults
-        .map { |f| File.basename(f.path) } - EXCLUDED_EXECUTABLES # that bundler installs with bundle gem <name
-    end.flatten
-      .compact
-      .sort
-      .map { |binary| "bin/#{binary}" }
   end
 
   def gems_in_group(gems, group_name)
