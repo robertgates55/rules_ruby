@@ -24,18 +24,41 @@ BUILD_HEADER = <<~MAIN_TEMPLATE
       ],
     ),
   )
-  # DAVE
-  # PULL EACH GEM INDIVIDUALLY
+
 MAIN_TEMPLATE
+
+LOCAL_GEM_TEMPLATE = <<~LOCAL_GEM_TEMPLATE
+  genrule(
+    name = "{name}-gem-install",
+    srcs = [],
+    exec_tools = {dependencies},
+    outs = ["{name}.tar.gz"],
+    cmd = """
+      export BUILD_HOME=$$PWD
+      export GEM_HOME=$$BUILD_HOME/gem
+      mkdir -p $$GEM_HOME
+
+      # Unpack dependencies
+      for tarball in {dep_tars}; do
+        tar -xzf $$tarball -C $$GEM_HOME
+      done
+
+      cd $$BUILD_HOME
+      tar -czf $@ -C $$GEM_HOME . >/dev/null
+    """,
+    message = "Installing gem: {name}:{version}",
+    visibility = ["//visibility:public"],
+  )
+LOCAL_GEM_TEMPLATE
 
 GEM_TEMPLATE = <<~GEM_TEMPLATE
   genrule(
     name = "{name}-gem-fetch",
     srcs = [],
-    outs = ["{name}-{version}.gem"],
+    outs = ["{gem_name}.gem"],
     cmd = """
-      gem fetch --platform x86_64-linux --no-prerelease --source {source} --version {version} {name} >/dev/null
-      # Platform-specific gems contain the platform in their filename
+      TARGET_PLATFORM="x86_64-linux"
+      gem fetch --platform $$TARGET_PLATFORM --no-prerelease --source {source} --version {version} {name} >/dev/null
       mv {name}-{version}*.gem $@ >/dev/null
     """,
     message = "Fetching gem: {name}:{version}",
@@ -45,19 +68,44 @@ GEM_TEMPLATE = <<~GEM_TEMPLATE
   genrule(
     name = "{name}-gem-install",
     srcs = [":{name}-gem-fetch"],
+    exec_tools = {dependencies},
     outs = ["{name}.tar.gz"],
     cmd = """
-      export GEM_HOME=$$PWD/gem
+      export BUILD_HOME=$$PWD
+      cp $< $$BUILD_HOME
+
+      export GEM_HOME=$$BUILD_HOME/gem
       mkdir -p $$GEM_HOME
-      mv $< $$PWD
-      gem install --platform x86_64-linux --no-post-install-message --no-document --no-wrappers --ignore-dependencies --local --version {version} {name} >/dev/null || true
-      # BINFILES=$$(find $$GEM_HOME/bin -type l)
-      # if [ -n "$${BINFILES}" ]; then
-      #   cd $$GEM_HOME
-      #   ls -l
-      #   find bin -type l -exec echo {} \;
-      #   cd -
-      # fi
+
+      # Unpack dependencies
+      for tarball in {dep_tars}; do
+        tar -xzf $$tarball -C $$GEM_HOME
+      done
+      
+      TARGET_PLATFORM="x86_64-linux"
+      GEM_PLATFORM=$$(gem specification {name}-{version}.gem --yaml | grep 'platform: ' | awk '{print $$2}')
+      ENV_PLATFORM=$$(gem environment platform)
+      TARGET_PLATFORM_MATCH=$$(echo $$ENV_PLATFORM | grep $$TARGET_PLATFORM >/dev/null; echo $$?)
+      GEM_PLATFORM_MATCH=$$(echo $$ENV_PLATFORM | grep $$GEM_PLATFORM >/dev/null; echo $$?)
+      
+      GEM_NO_EXTENSIONS=$$(gem specification {name}-{version}.gem --yaml | grep 'extensions: \\[\\]' >/dev/null; echo $$?) # 0 = no extensions
+
+      if [ "$${TARGET_PLATFORM_MATCH}" -eq "0" ] || ( [ "$${GEM_NO_EXTENSIONS}" -eq "0" ] && [ "$${GEM_PLATFORM_MATCH}" -eq "0" ] )
+      then
+        gem install --platform $$TARGET_PLATFORM --no-document --no-wrappers --ignore-dependencies --local --version {version} {name} >/dev/null 2>&1
+        # Symlink all the bin files
+        cd $$GEM_HOME
+        find ./bin -type l -exec sh -c 'if [[ $$(readlink $$0) == /* ]]; then (export TARGET_ABS=$$(readlink $$0) REPLACE="$${PWD}/"; rm $$0; ln -s ../"$${TARGET_ABS/"$${REPLACE}"/}" $$0); fi' {} \\;
+        # Clean up files we don't need in the bundle
+        rm -rf $$GEM_HOME/wrappers $$GEM_HOME/environment $$GEM_HOME/cache/{name}-{version}*.gem
+      else
+        echo ++++ {name} Incompatible platform or extensions to build - keep the gem for later install
+        mkdir -p $$GEM_HOME/cache
+        mv $$BUILD_HOME/{name}-{version}.gem $$GEM_HOME/cache
+        ln -s {name}-{version}.gem $$GEM_HOME/cache/{name}-{version}-$$TARGET_PLATFORM.gem
+      fi
+
+      cd $$BUILD_HOME
       tar -czf $@ -C $$GEM_HOME . >/dev/null
     """,
     message = "Installing gem: {name}:{version}",
@@ -68,10 +116,11 @@ GEM_TEMPLATE
 GEM_GROUP = <<~GEM_GROUP
   pkg_tar(
     name = "gems-{group}",
-    srcs = {group_gem_installs},
+    deps = {group_gem_installs},
     owner = "1000.1000",
     package_dir = "/vendor/bundle/ruby/{ruby_version}"
   )
+
 GEM_GROUP
 
 ALL_GEMS = <<~ALL_GEMS
@@ -174,8 +223,7 @@ class BundleBuildFileGenerator
               :repo_name,
               :build_file,
               :gemfile_lock,
-              :includes,
-              :excludes,
+              :srcs,
               :ruby_version
 
   DEFAULT_EXCLUDES = ['**/* *.*', '**/* */*'].freeze
@@ -186,14 +234,12 @@ class BundleBuildFileGenerator
                  repo_name:,
                  build_file: 'BUILD.bazel',
                  gemfile_lock: 'Gemfile.lock',
-                 includes: nil,
-                 excludes: nil)
+                 srcs: nil)
     @workspace_name = workspace_name
     @repo_name      = repo_name
     @build_file     = build_file
     @gemfile_lock   = gemfile_lock
-    @includes       = includes
-    @excludes       = excludes
+    @srcs           = srcs
     # This attribute returns 0 as the third minor version number, which happens to be
     # what Ruby uses in the PATH to gems, eg. ruby 2.6.5 would have a folder called
     # ruby/2.6.0/gems for all minor versions of 2.6.*
@@ -209,27 +255,37 @@ class BundleBuildFileGenerator
                         .gsub('{ruby_version}', ruby_version)
                         .gsub('{bundler_setup}', bundler_setup_require)
 
-    # Append to the end specific gem libraries and dependencies
-    bundle           = Bundler::LockfileParser.new(Bundler.read_file(gemfile_lock))
+    # Get all the gems
+    bundle = Bundler::LockfileParser.new(Bundler.read_file(gemfile_lock))
     bundle.specs.each { |spec| register_gem(spec, template_out) }
 
-    remote_gems = bundle.specs.delete_if{ |spec| spec.source.path? }.map(&:name)
+    register_bundler(template_out)
+
+    remote_gems = bundle.specs
+                        .delete_if{ |spec| spec.source.path? }
+                        .map(&:name)
     template_out.puts ALL_GEMS
                         .gsub('{gems}', remote_gems.map { |g| ":#{g}-gem-install" }.to_s)
                         .gsub('{cached_gems}', remote_gems.map { |g| ":#{g}-gem-fetch" }.to_s)
                         .gsub('{ruby_version}', ruby_version)
 
+    # Groups stuff - we can extract this from the gemfile.lock
+    bundle_def    = Bundler::Definition.build(gemfile_lock.chomp('.lock'), gemfile_lock, {})
+    # gems_by_group = bundle_def.groups.map{ |g| {g =>
+    #   bundle_def
+    #          .specs_for([g])
+    #          .map(&:name)
+    #          .flatten
+    #          .uniq
+    #          .select{|spec_name| remote_gems.include? spec_name}
+    # }}.reduce Hash.new, :merge
 
-    # Groups stuff - we can extract this from the gemfile.lock,
-    # but via a slightly different route as we need to traverse all the deps
-    bundle_deps      = Bundler::Definition.build(gemfile_lock.chomp('.lock'), gemfile_lock, {}).dependencies
-    groups           = bundle_deps.map{|dep| dep.groups}.flatten.uniq
-    gems_by_group    = groups.map{ |g| {g => bundle_deps
-                       .select{|dep| dep.groups.include?(g)}
-                       .reject{|dep| dep.source.path? unless dep.source.nil?}
-                       .map(&:name)}
-                      }
-                      .reduce Hash.new, :merge
+    gems_by_group = bundle_def.groups.map{ |g| {g =>
+       bundle_def
+         .dependencies
+         .select{|dep| dep.groups.include? g.to_sym}
+         .map(&:name)
+    }}.reduce Hash.new, :merge
 
     gems_by_group.each do |key, value|
       template_out.puts GEM_GROUP
@@ -252,15 +308,28 @@ class BundleBuildFileGenerator
   end
 
   def register_gem(spec, template_out)
-    # Do not register local gems
-    return if spec.source.path?
+    template_to_use = (spec.source.path?) ? LOCAL_GEM_TEMPLATE : GEM_TEMPLATE
 
-    puts spec.platform if spec.name == 'nokogiri'
+    template_out.puts template_to_use
+                        .gsub('{name}', spec.name)
+                        .gsub('{gem_name}', "#{spec.name}-#{spec.version}")
+                        .gsub('{dependencies}', spec.dependencies.map{|spec| "#{spec.name}-gem-install"}.to_s)
+                        .gsub('{dep_tars}', spec.dependencies.map{|spec| "$(location :#{spec.name}-gem-install)"}.join(' '))
+                        .gsub('{version}', spec.version.version)
+                        .gsub('{source}', spec.source.path? ? '' : spec.source.remotes.first.to_s)
+                        .gsub('{ruby_version}', ruby_version)
+  end
+
+  def register_bundler(template_out)
+    bundler_version = Bundler::VERSION
 
     template_out.puts GEM_TEMPLATE
-                        .gsub('{name}', spec.name)
-                        .gsub('{version}', spec.version.version)
-                        .gsub('{source}', spec.source.remotes.first.to_s)
+                        .gsub('{name}', 'bundler')
+                        .gsub('{gem_name}', "bundler-#{bundler_version}")
+                        .gsub('{dependencies}', "[]")
+                        .gsub('{dep_tars}', "")
+                        .gsub('{version}', bundler_version)
+                        .gsub('{source}', 'https://rubygems.org')
                         .gsub('{ruby_version}', ruby_version)
   end
 
@@ -281,20 +350,19 @@ class BundleBuildFileGenerator
   end
 end
 
-# ruby ./create_bundle_build_file.rb "BUILD.bazel" "Gemfile.lock" "repo_name" "{}" "{}" "wsp_name"
+# ruby ./create_bundle_build_file.rb "BUILD.bazel" "Gemfile.lock" "repo_name" "{}" "wsp_name"
 if $0 == __FILE__
-  if ARGV.length != 6
-    warn("USAGE: #{$0} BUILD.bazel Gemfile.lock repo-name {includes-json} {excludes-json} workspace-name".orange)
+  if ARGV.length != 5
+    warn("USAGE: #{$0} BUILD.bazel Gemfile.lock repo-name {srcs} workspace-name".orange)
     exit(1)
   end
 
-  build_file, gemfile_lock, repo_name, includes, excludes, workspace_name, * = *ARGV
+  build_file, gemfile_lock, repo_name, srcs, workspace_name, * = *ARGV
 
   BundleBuildFileGenerator.new(build_file:     build_file,
                                gemfile_lock:   gemfile_lock,
                                repo_name:      repo_name,
-                               includes:       JSON.parse(includes),
-                               excludes:       JSON.parse(excludes),
+                               srcs:           srcs,
                                workspace_name: workspace_name).generate!
 
   begin

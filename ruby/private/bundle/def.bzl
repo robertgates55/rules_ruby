@@ -130,8 +130,7 @@ def generate_bundle_build_file(runtime_ctx, previous_result):
         "BUILD.bazel",  # Bazel build file (can be empty)
         gemfile_lock,  # Gemfile.lock where we list all direct and transitive dependencies
         runtime_ctx.ctx.name,  # Name of the target
-        repr(runtime_ctx.ctx.attr.includes),
-        repr(runtime_ctx.ctx.attr.excludes),
+        repr(runtime_ctx.ctx.attr.srcs),
         RULES_RUBY_WORKSPACE_NAME,
     ]
 
